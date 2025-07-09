@@ -1,0 +1,782 @@
+---
+title: "Bayesian analysis"
+author: "Group 16"
+date: "2025-05-29"
+output:
+  html_document:
+    toc: true              
+    toc_depth: 3            
+    toc_float: true        
+    number_sections: true   
+---
+
+
+```{r setup, include=FALSE}
+library(unmarked)
+library(rjags)
+library(coda)
+library(MCMCvis)
+library(nimble)
+
+# 载入crossbill数据（欧洲交嘴雀动态占据数据）
+data("crossbill", package = "unmarked")
+str(crossbill) 
+```
+
+# 数据预处理
+
+```{r}
+# 设置维度信息
+nsite <- nrow(crossbill)   # 站点数量
+nyear <- 9                 # 年数 (1999-2007)
+nrep <- 3                  # 每年重复观测次数
+
+# 初始化观测数据的三维数组 [站点, 重复, 年份]
+y_array <- array(NA, dim = c(nsite, nrep, nyear))
+
+# 提取每年观测数据并存入数组
+for(t in 1:nyear) {
+  year_code <- ifelse(t == 1, "99", sprintf("%02d", t - 2))  # e.g. "99", "00", ..., "07"
+  det_cols <- paste0("det", year_code, 1:3)                  # 对应列名如 "det991", "det992", "det993"
+  y_array[ , , t] <- as.matrix(crossbill[ , det_cols])       # 转换为矩阵写入数组
+}
+
+# 检查数组结构及第一个站点的数据
+dim(y_array)
+y_array[1, , ]
+```
+
+# JAGS模型
+
+使用贝叶斯层次模型（*jags*）描述物种占据动态，，用于分析生态学中多个地点在若干年份内物种的占据状态及其动态变化。模型通过*贝叶斯方法*估计初始占据概率、定殖概率、存续概率和探测概率，结合观测数据推断每个地点每年的占据情况。还计算了占据率的衍生指标，如占据率变化的**增长率**和**物种更替率**，帮助理解生态系统的动态特征。为了保证模型的稳健性，设计了三组不同的初始值，采用多链MCMC采样进行参数估计。
+
+```{r}
+# JAGS：
+model_code <- "
+model {
+  # 先验分布
+  psi ~ dbeta(1,1)                        # 初始占据概率
+  for(i in 1:(nyear-1)) {
+    gamma[i] ~ dbeta(1,1)                # 定殖概率
+    phi[i] ~ dbeta(1,1)                  # 存续概率
+    p[i] ~ dbeta(1,1)                    # 探测概率
+  }
+  p[nyear] ~ dbeta(1,1)
+
+  # 状态过程
+  for(i in 1:nsite) {
+    z[i,1] ~ dbern(psi)
+    for(t in 2:nyear) {
+      muZ[i,t] <- z[i,t-1]*phi[t-1] + (1 - z[i,t-1])*gamma[t-1]
+      z[i,t] ~ dbern(muZ[i,t])
+    }
+  }
+
+  # 观测过程
+  for(t in 1:nyear) {
+    for(i in 1:nsite) {
+      for(j in 1:nrep) {
+        Py[i,j,t] <- z[i,t] * p[t]
+        y[i,j,t] ~ dbern(Py[i,j,t])
+      }
+    }
+  }
+
+  # 衍生量
+  psivec[1] <- psi
+  psi.fs[1] <- sum(z[1:nsite,1]) / nsite
+  for(t in 2:nyear) {
+    psivec[t] <- psivec[t-1]*phi[t-1] + (1 - psivec[t-1])*gamma[t-1]
+    psi.fs[t] <- sum(z[1:nsite,t]) / nsite
+    growthr[t] <- psivec[t] / psivec[t-1]
+    turnover[t-1] <- (1 - psivec[t-1]) * gamma[t-1] / psivec[t]
+  }
+}
+"
+
+# 数据准备
+jags_data <- list(
+  nsite = nsite,
+  nyear = nyear,
+  nrep = nrep,
+  y = y_array
+)
+
+
+set.seed(1)
+
+# 初始值函数1：中性
+initial_function_1 <- function() {
+  z_init <- matrix(0, nsite, nyear)
+  for(i in 1:nsite) {
+    for(t in 1:nyear) {
+      if(sum(y_array[i,,t], na.rm = TRUE) > 0) {
+        z_init[i,t] <- 1
+      } else {
+        z_init[i,t] <- rbinom(1, 1, 0.5)
+      }
+    }
+  }
+  list(psi=0.5, phi=rep(0.5, nyear-1), gamma=rep(0.5, nyear-1), p=rep(0.5, nyear), z=z_init)
+}
+
+# 初始值函数2：低占据率
+initial_function_2 <- function() {
+  z_init <- matrix(0, nsite, nyear)
+  for(i in 1:nsite) {
+    for(t in 1:nyear) {
+      if(sum(y_array[i,,t], na.rm = TRUE) > 0) z_init[i,t] <- 1
+    }
+  }
+  list(psi=0.2, phi=rep(0.2, nyear-1), gamma=rep(0.2, nyear-1), p=rep(0.2, nyear), z=z_init)
+}
+
+# 初始值函数3：高占据率
+initial_function_3 <- function() {
+  z_init <- matrix(1, nsite, nyear)  # 所有都设为1
+  list(psi=0.8, phi=rep(0.8, nyear-1), gamma=rep(0.8, nyear-1), p=rep(0.8, nyear), z=z_init)
+}
+
+# 聚合三组链的初始值
+init_list <- list(initial_function_1(), initial_function_2(), initial_function_3())
+
+# 设置参数
+params_to_monitor <- c("psi", "phi", "gamma", "p", "psi.fs", "psivec", "growthr", "turnover", "z")
+n.iter <- 20000
+n.burnin <- 10000
+n.thin <- 10
+
+# 编译JAGS模型
+jags_model <- jags.model(
+  textConnection(model_code),
+  data = jags_data,
+  inits = init_list,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+
+```
+
+## 采样处理
+
+在完成模型的 *burn-in* 阶段后，我们进行正式采样，并提取模型的后验统计量，包括均值和95%置信区间（CI），具体包括：
+
+- 初始占据概率（psi）
+- 各年份的留存概率（phi）
+- 各年份的定殖概率（gamma）
+- 各年份的探测概率（p）
+- 各年份样本实际占据率（psi.fs）
+
+```{r}
+# burn-in阶段
+update(jags_model, n.iter = n.burnin)
+
+# 正式采样
+mcmc_samples <- coda.samples(jags_model, variable.names = params_to_monitor,
+                             n.iter = (n.iter - n.burnin), thin = n.thin)
+
+# 汇总后验分布
+summary_stats <- summary(mcmc_samples)
+stats <- summary_stats$statistics
+quants <- summary_stats$quantiles
+
+# 初始占据概率 psi
+psi_mean <- stats["psi", "Mean"]
+psi_CI <- quants["psi", c("2.5%", "97.5%")]
+
+# 各年份留存概率 phi[t]
+phi_means <- stats[grep("^phi\\[", rownames(stats)), "Mean"]
+phi_CIs <- quants[grep("^phi\\[", rownames(quants)), c("2.5%", "97.5%")]
+
+# 各年份定殖概率 gamma[t]
+gamma_means <- stats[grep("^gamma\\[", rownames(stats)), "Mean"]
+gamma_CIs <- quants[grep("^gamma\\[", rownames(quants)), c("2.5%", "97.5%")]
+
+# 各年份探测概率 p[t]
+p_means <- stats[grep("^p\\[", rownames(stats)), "Mean"]
+p_CIs <- quants[grep("^p\\[", rownames(quants)), c("2.5%", "97.5%")]
+
+# 各年样本实际占据率 psi.fs[t]
+psi_fs_means <- stats[grep("^psi.fs", rownames(stats)), "Mean"]
+psi_fs_CIs <- quants[grep("^psi.fs", rownames(quants)), c("2.5%", "97.5%")]
+
+cat(
+  sprintf("psi (初始占据概率) 后验均值 = %.3f, 95%%CI = [%.3f, %.3f]\n\n", psi_mean, psi_CI[1], psi_CI[2]),
+  
+  "phi (各年份留存概率) 后验均值及95%CI:\n",
+  paste0(
+    apply(
+      cbind(mean = phi_means, l95 = phi_CIs[,1], u95 = phi_CIs[,2]),
+      1,
+      function(x) sprintf("  %.3f [%.3f, %.3f]", x[1], x[2], x[3])
+    ),
+    collapse = "\n"
+  ), "\n\n",
+  
+  "gamma (各年份定殖概率) 后验均值及95%CI:\n",
+  paste0(
+    apply(
+      cbind(mean = gamma_means, l95 = gamma_CIs[,1], u95 = gamma_CIs[,2]),
+      1,
+      function(x) sprintf("  %.3f [%.3f, %.3f]", x[1], x[2], x[3])
+    ),
+    collapse = "\n"
+  ), "\n\n",
+  
+  "p (各年份探测概率) 后验均值及95%CI:\n",
+  paste0(
+    apply(
+      cbind(mean = p_means, l95 = p_CIs[,1], u95 = p_CIs[,2]),
+      1,
+      function(x) sprintf("  %.3f [%.3f, %.3f]", x[1], x[2], x[3])
+    ),
+    collapse = "\n"
+  ), "\n\n",
+  
+  "psi.fs (各年样本实际占据率) 后验均值及95%CI:\n",
+  paste0(
+    apply(
+      cbind(mean = psi_fs_means, l95 = psi_fs_CIs[,1], u95 = psi_fs_CIs[,2]),
+      1,
+      function(x) sprintf("  %.3f [%.3f, %.3f]", x[1], x[2], x[3])
+    ),
+    collapse = "\n"
+  ), "\n"
+)
+
+```
+
+以下图表展示了模型中关键参数的后验均值及其95%置信区间，帮助理解这些参数随时间的动态变化趋势。
+
+```{r}
+# 提取psivec均值和置信区间
+psivec_means <- stats[grep("^psivec", rownames(stats)), "Mean"]
+psivec_CIs <- quants[grep("^psivec", rownames(quants)), c("2.5%", "97.5%")]
+
+years <- 1999:2007
+psi_fs_mean <- psi_fs_means
+psi_fs_l95 <- psi_fs_CIs[, 1]
+psi_fs_u95 <- psi_fs_CIs[, 2]
+
+# 均值折线图
+plot(years, psi_fs_mean, type = "b", pch = 16, ylim = c(0, 1),
+     xlab = "年份", ylab = "样本占据率 (psi.fs)", main = "psi.fs后验均值及95%CI")
+
+polygon(c(years, rev(years)), c(psi_fs_l95, rev(psi_fs_u95)),
+        col = rgb(0.7, 0.7, 0.7, 0.5), border = NA)
+
+# 叠加均值线
+lines(years, psi_fs_mean, type = "b", pch = 16, col = "blue")
+
+```
+
+```{r}
+# 提取gamma均值和置信区间
+years <- 1999:2006
+gamma_mean <- gamma_means
+gamma_l95 <- gamma_CIs[, 1]
+gamma_u95 <- gamma_CIs[, 2]
+
+# 画均值折线图
+plot(years, gamma_mean, type = "b", pch = 16, ylim = c(0, 1),
+     xlab = "年份", ylab = "定殖率 (gamma)", main = "gamma后验均值及95%CI")
+
+# 加置信区间阴影
+polygon(c(years, rev(years)), c(gamma_l95, rev(gamma_u95)),
+        col = rgb(0.7, 0.7, 0.7, 0.5), border = NA)
+
+# 叠加均值线
+lines(years, gamma_mean, type = "b", pch = 16, col = "blue")
+
+# 提取phi均值和置信区间
+years <- 1999:2006
+phi_mean <- phi_means
+phi_l95 <- phi_CIs[, 1]
+phi_u95 <- phi_CIs[, 2]
+
+# 绘制均值折线图
+plot(years, phi_mean, type = "b", pch = 16, ylim = c(0, 1),
+     xlab = "年份", ylab = "生存率 (phi)", main = "phi后验均值及95%CI")
+
+# 绘制置信区间阴影
+polygon(c(years, rev(years)), c(phi_l95, rev(phi_u95)),
+        col = rgb(0.7, 0.7, 0.7, 0.5), border = NA)
+
+# 叠加均值线
+lines(years, phi_mean, type = "b", pch = 16, col = "blue")
+
+# 提取p均值和置信区间
+years <- 1999:2007
+p_mean <- p_means
+p_l95 <- p_CIs[, 1]
+p_u95 <- p_CIs[, 2]
+
+# 绘制均值折线图
+plot(years, p_mean, type = "b", pch = 16, ylim = c(0, 1),
+     xlab = "年份", ylab = "观测概率 (p)", main = "p后验均值及95%CI")
+
+# 绘制置信区间阴影
+polygon(c(years, rev(years)), c(p_l95, rev(p_u95)),
+        col = rgb(0.7, 0.7, 0.7, 0.5), border = NA)
+
+# 叠加均值线
+lines(years, p_mean, type = "b", pch = 16, col = "blue")
+
+# 提取psivec均值和置信区间
+years <- 1999:2007
+psivec_mean <- psivec_means
+psivec_l95 <- psivec_CIs[, 1]
+psivec_u95 <- psivec_CIs[, 2]
+
+# 绘制均值折线图
+plot(years, psivec_mean, type = "b", pch = 16, ylim = c(0, 1),
+     xlab = "年份", ylab = "占据率 (psivec)", main = "psivec后验均值及95%CI")
+
+# 添加置信区间阴影
+polygon(c(years, rev(years)), c(psivec_l95, rev(psivec_u95)),
+        col = rgb(0.7, 0.7, 0.7, 0.5), border = NA)
+
+# 叠加均值线
+lines(years, psivec_mean, type = "b", pch = 16, col = "blue")
+
+```
+
+
+## 采样诊断
+
+通过轨迹图可以观察参数采样的稳定性，判断链是否混合良好。密度图展示参数的后验分布形态。
+
+```{r}
+# traceplot
+par(mfrow = c(2, 2))
+traceplot(mcmc_samples[, c("psi", "phi[1]", "gamma[1]", "p[1]")],
+          col = c("black", "red", "green"))
+
+par(mfrow = c(2, 2))
+params <- c("psi", "phi[1]", "gamma[1]", "p[1]")
+# 4个参数的密度图
+densplot(mcmc_samples[, "psi"], main = "psi")
+densplot(mcmc_samples[, "phi[1]"], main = "phi[1]")
+densplot(mcmc_samples[, "gamma[1]"], main = "gamma[1]")
+densplot(mcmc_samples[, "p[1]"], main = "p[1]")
+
+```
+
+潜在尺度缩减因子（PSRF，也称为Rhat）用于评估多条链的收敛情况，理想情况下Rhat应接近1，表明各链采样结果一致。
+
+```{r}
+# 计算PSRF（潜在尺度缩减因子）
+gelman_result <- gelman.diag(mcmc_samples[, params], autoburnin = FALSE)
+
+print(gelman_result)
+
+cat("\n各参数的 PSRF（R^）和97.5%置信上限：\n")
+rhat_table <- data.frame(
+  Parameter = params,
+  Rhat = round(gelman_result$psrf[, 1], 3),
+  UpperCI = round(gelman_result$psrf[, 2], 3)
+)
+print(rhat_table)
+
+cat("\n多元潜在尺度缩减因子 MPSRF = ", round(gelman_result$mpsrf, 3), "\n")
+
+gelman_plot <- gelman.plot(mcmc_samples[, params], autoburnin = FALSE)
+
+```
+
+# nimble模型
+
+使用**nimble**构建动态占据模型，估计物种占据状态及相关参数。
+
+```{r}
+# 提取以"det"开头的探测列
+det_cols <- grep("^det", names(crossbill))
+y_raw <- crossbill[, det_cols]
+
+# 重塑为3维数组 [站点, 调查次数, 年份]
+Y <- array(NA, dim = c(nsite, nrep, nyear))
+for (t in 1:nyear) {
+  year_suffix <- substr(as.character(years[t]), 3, 4)
+  for (j in 1:nrep) {
+    col_name <- paste0("det", year_suffix, j)
+    Y[, j, t] <- crossbill[[col_name]]
+  }
+}
+
+# nimble模型代码：动态占据模型
+dyn_occ_code <- nimbleCode({
+  psi ~ dunif(0, 1)       # 初始占据率
+  p ~ dunif(0, 1)         # 探测概率
+  for (t in 1:(nyear-1)) {
+    phi[t] ~ dunif(0, 1)    # 生存概率
+    gamma[t] ~ dunif(0, 1)  # 殖民概率
+  }
+  
+  # 初始年份状态和观测
+  for (i in 1:nsite) {
+    z[i,1] ~ dbern(psi)
+    for (j in 1:nrep) {
+      y[i,j,1] ~ dbern(z[i,1] * p)
+    }
+  }
+  
+  # 后续年份状态和观测
+  for (t in 2:nyear) {
+    for (i in 1:nsite) {
+      z[i,t] ~ dbern(z[i,t-1] * phi[t-1] + (1 - z[i,t-1]) * gamma[t-1])
+      for (j in 1:nrep) {
+        y[i,j,t] ~ dbern(z[i,t] * p)
+      }
+    }
+  }
+  
+  # 派生量：总体占据率、样本占据率、增长率和周转率
+  psi_vec[1] <- psi
+  for (t in 2:nyear) {
+    psi_vec[t] <- psi_vec[t-1] * phi[t-1] + (1 - psi_vec[t-1]) * gamma[t-1]
+  }
+  for (t in 1:nyear) {
+    psi_fs[t] <- sum(z[1:nsite, t]) / nsite
+  }
+  for (t in 2:nyear) {
+    growthr[t-1] <- psi_vec[t] / psi_vec[t-1]
+    turnover[t-1] <- gamma[t-1] * (1 - psi_vec[t-1]) / psi_vec[t]
+  }
+})
+
+# 模型常量和数据
+constants <- list(nsite = nsite, nrep = nrep, nyear = nyear)
+data <- list(y = Y)
+
+# 初始值函数，基于观测初始化z
+
+inits <- function() {
+  z_guess <- array(1, dim = c(nsite, nyear))
+  for (i in 1:nsite) {
+    for (t in 1:nyear) {
+      z_guess[i, t] <- ifelse(sum(Y[i, , t], na.rm = TRUE) > 0, 1, 0)
+    }
+  }
+  list(
+    psi = runif(1, 0.2, 0.8),
+    phi = runif(nyear-1, 0, 1),
+    gamma = runif(nyear-1, 0, 1),
+    p = runif(1, 0, 1),
+    z = z_guess
+  )
+}
+
+# 三条链初始值列表
+inits_list <- list(inits(), inits(), inits())
+
+# 创建nimble模型对象
+dyn_occ_model <- nimbleModel(code = dyn_occ_code, data = data, constants = constants, inits = inits_list[[1]])
+
+
+```
+
+进行编译以提升计算效率，配置并运行MCMC采样，提取后验样本并进行基本统计汇总
+
+```{r}
+# 编译模型提升效率
+dyn_occ_cmodel <- compileNimble(dyn_occ_model)
+
+# 配置MCMC采样器，指定监控参数，启用WAIC
+parameters <- c("psi", "phi", "gamma", "p", "psi_vec", "psi_fs", "growthr", "turnover")
+dyn_occ_conf <- configureMCMC(dyn_occ_model, monitors = parameters, enableWAIC = TRUE, print = FALSE)
+dyn_occ_MCMC <- buildMCMC(dyn_occ_conf)
+dyn_occ_cMCMC <- compileNimble(dyn_occ_MCMC, project = dyn_occ_model)
+
+# 设置采样参数
+niter <- 20000
+nburn <- 5000
+nthin <- 1
+nchains <- 3
+
+# 运行3条链MCMC采样，返回coda格式样本和汇总
+samples_list <- runMCMC(dyn_occ_cMCMC,
+                        niter = niter,
+                        nburnin = nburn,
+                        nchains = nchains,
+                        thin = nthin,
+                        samplesAsCodaMCMC = TRUE,
+                        summary = TRUE,
+                        WAIC = TRUE)
+
+
+mcmc_list <- samples_list$samples  # 提取 mcmc.list
+summary(mcmc_list)                 # 查看后验统计量
+MCMCsummary(mcmc_list, round = 3)
+
+# 计算均值、标准差和95%置信区间
+summary_stats <- summary(mcmc_list)
+stats_table <- cbind(summary_stats$statistics[, c("Mean", "SD")],
+                     summary_stats$quantiles[, c("2.5%", "97.5%")])
+print(round(stats_table, 3))
+
+
+```
+
+## 采样诊断
+
+使用Gelman-Rubin诊断指标评估采样链的收敛性，并绘制轨迹图和自相关图来辅助判断
+
+```{r}
+# Gelman-Rubin 诊断（单变量）
+gelman_diag <- gelman.diag(mcmc_list, multivariate = FALSE)
+print(gelman_diag)
+
+# 画traceplot（psi, phi[1], gamma[1], p[1]）
+MCMCtrace(mcmc_list, params, ISB = FALSE, pdf = FALSE)
+
+# 自相关图示例
+acfplot(mcmc_list[, "psi"])
+acfplot(mcmc_list[, "phi[1]"])
+acfplot(mcmc_list[, "gamma[1]"])
+
+
+```
+
+# 引入协变量
+
+维度整理、标准化协变量处理，并构建带/不带协变量的动态占据JAGS模型
+
+```{r}
+# 基本数据维度
+nsite <- nrow(crossbill)               # 样点数量
+det_cols <- grep("^det", names(crossbill))   # 探测列
+date_cols <- grep("^date", names(crossbill)) # 日期列
+nseason <- length(det_cols) / max(crossbill$surveys)  # 季节数
+nrep <- max(crossbill$surveys)         # 每季最大调查次数
+
+# 重塑检测数据为三维数组 [site, season, rep]
+det_matrix <- as.matrix(crossbill[, det_cols])
+det_array <- array(NA, dim = c(nsite, nseason, nrep))
+for (t in 1:nseason) {
+  cols_t <- ((t - 1) * nrep + 1):(t * nrep)
+  det_array[, t, ] <- det_matrix[, cols_t]
+}
+
+# 重塑日期数据同理
+date_matrix <- as.matrix(crossbill[, date_cols])
+date_array <- array(NA, dim = c(nsite, nseason, nrep))
+for (t in 1:nseason) {
+  cols_t <- ((t - 1) * nrep + 1):(t * nrep)
+  date_array[, t, ] <- date_matrix[, cols_t]
+}
+
+# 环境变量标准化
+elev <- crossbill$ele
+forest <- crossbill$forest
+elev_mean <- mean(elev)
+elev_sd <- sd(elev)
+forest_mean <- mean(forest)
+forest_sd <- sd(forest)
+elev_z <- scale(elev)[, 1]    # 标准化海拔
+forest_z <- scale(forest)[, 1] # 标准化森林覆盖率
+
+# 日期标准化
+all_dates <- na.omit(as.numeric(unlist(crossbill[, date_cols])))
+date_mean <- mean(all_dates)
+date_sd <- sd(all_dates)
+date_array_z <- (date_array - date_mean) / date_sd
+date_array_z[is.na(date_array_z)] <- 0  # 缺失替换0
+
+# JAGS数据列表
+jags_data <- list(
+  nsite = nsite,
+  nseason = nseason,
+  nrep = nrep,
+  y = det_array,
+  elev = elev_z,
+  forest = forest_z,
+  day = date_array_z,
+  surveys = crossbill$surveys
+)
+
+# 初始占据状态矩阵基于观测情况，随机扰动处理未检测到的情况
+set.seed(123)
+Z_init_det <- apply(det_array, c(1, 2), function(x) as.numeric(any(x == 1, na.rm = TRUE)))
+Z_init_all1 <- matrix(1, nsite, nseason)
+Z_init_rand <- Z_init_det
+for (i in 1:nsite) {
+  for (t in 1:nseason) {
+    if (Z_init_rand[i, t] == 0) {
+      Z_init_rand[i, t] <- rbinom(1, 1, 0.5)
+    }
+  }
+}
+
+# 三组初始值，对应3条MCMC链
+inits_list <- list(
+  list(Z = Z_init_all1),
+  list(Z = Z_init_rand),
+  list(Z = Z_init_det)
+)
+
+# 带协变量的动态占据JAGS模型字符串
+model_string_cov <- "
+model {
+  # 先验
+  psiBeta0 ~ dnorm(0, 0.001)
+  psiBeta1 ~ dnorm(0, 0.001)
+  psiBeta2 ~ dnorm(0, 0.001)
+  phiBeta0 ~ dnorm(0, 0.001)
+  phiBeta1 ~ dnorm(0, 0.001)
+  phiBeta2 ~ dnorm(0, 0.001)
+  gammaBeta0 ~ dnorm(0, 0.001)
+  gammaBeta1 ~ dnorm(0, 0.001)
+  gammaBeta2 ~ dnorm(0, 0.001)
+  delta0 ~ dnorm(0, 0.001)
+  delta1 ~ dnorm(0, 0.001)
+  delta2 ~ dnorm(0, 0.001)
+  delta3 ~ dnorm(0, 0.001)
+
+  # 初始占据状态
+  for (i in 1:nsite) {
+    logit(psi[i]) <- psiBeta0 + psiBeta1 * elev[i] + psiBeta2 * forest[i]
+    Z[i, 1] ~ dbern(psi[i])
+  }
+
+  # 动态过程
+  for (i in 1:nsite) {
+    logit(phi[i]) <- phiBeta0 + phiBeta1 * elev[i] + phiBeta2 * forest[i]
+    logit(gamma[i]) <- gammaBeta0 + gammaBeta1 * elev[i] + gammaBeta2 * forest[i]
+
+    for (t in 2:nseason) {
+      muZ[i, t] <- Z[i, t-1] * phi[i] + (1 - Z[i, t-1]) * gamma[i]
+      Z[i, t] ~ dbern(muZ[i, t])
+    }
+  }
+
+  # 观测过程
+  for (i in 1:nsite) {
+    for (t in 1:nseason) {
+      for (j in 1:nrep) {
+        is_obs[i, t, j] <- step(surveys[i] - j + 0.1)
+        logit(p[i, t, j]) <- delta0 + delta1 * elev[i] + delta2 * forest[i] + delta3 * day[i, t, j]
+        y[i, t, j] ~ dbern(Z[i, t] * p[i, t, j] * is_obs[i, t, j])
+      }
+    }
+  }
+}
+"
+
+# 无协变量的基准模型字符串
+model_string_null <- "
+model {
+  psi ~ dbeta(1,1)
+  phi ~ dbeta(1,1)
+  gamma ~ dbeta(1,1)
+  p ~ dbeta(1,1)
+
+  for (i in 1:nsite) {
+    Z[i, 1] ~ dbern(psi)
+    for (t in 2:nseason) {
+      muZ[i, t] <- Z[i, t-1] * phi + (1 - Z[i, t-1]) * gamma
+      Z[i, t] ~ dbern(muZ[i, t])
+    }
+    for (t in 1:nseason) {
+      for (j in 1:surveys[i]) {
+        y[i, t, j] ~ dbern(Z[i, t] * p)
+      }
+    }
+  }
+}
+"
+
+# 写入临时文件以供JAGS调用
+writeLines(model_string_null, con = "model_null.txt")
+writeLines(model_string_cov, con = "model_cov.txt")
+
+# MCMC采样参数
+n.adapt <- 1000
+n.update <- 5000
+n.iter <- 10000
+thin <- 10
+
+# 拟合无协变量基准模型
+jm_null <- jags.model("model_null.txt", data = jags_data, inits = inits_list,
+                      n.chains = 3, n.adapt = n.adapt)
+
+
+```
+
+# 模型评估
+
+拟合、后验采样、收敛诊断，并计算DIC进行模型优劣比较
+
+```{r}
+# 1. 拟合无协变量模型，烧入后采样
+update(jm_null, n.iter = n.update)
+params_null <- c("psi", "phi", "gamma", "p")
+samples_null <- coda.samples(jm_null, variable.names = params_null, n.iter = n.iter, thin = thin)
+
+# 2. 拟合含协变量模型，烧入后采样
+jm_cov <- jags.model("model_cov.txt", data = jags_data, inits = inits_list, n.chains = 3, n.adapt = n.adapt)
+update(jm_cov, n.iter = n.update)
+params_cov <- c("psiBeta0","psiBeta1","psiBeta2",
+                "phiBeta0","phiBeta1","phiBeta2",
+                "gammaBeta0","gammaBeta1","gammaBeta2",
+                "delta0","delta1")
+samples_cov <- coda.samples(jm_cov, variable.names = params_cov, n.iter = n.iter, thin = thin)
+
+# 诊断与比较
+gelman.diag(samples_cov)        # Gelman-Rubin 诊断
+effectiveSize(samples_cov)      # 有效样本量
+
+# 计算DIC进行模型比较
+dic_null <- dic.samples(jm_null, n.iter = n.iter, type = "pD")
+dic_cov  <- dic.samples(jm_cov,  n.iter = n.iter, type = "pD")
+dic_dyn  <- dic.samples(jags_model, n.iter = 20000, type = "pD")
+
+# 汇总DIC
+DIC_null <- sum(dic_null$deviance) + sum(dic_null$penalty)
+DIC_cov  <- sum(dic_cov$deviance) + sum(dic_cov$penalty)
+DIC_dyn  <- sum(dic_dyn$deviance) + sum(dic_dyn$penalty)
+print(c(DIC_null = DIC_null, DIC_cov = DIC_cov, DIC_dyn = DIC_dyn))
+
+summary(samples_cov)            # 汇总样本统计
+
+
+```
+
+计算并绘制森林覆盖率对初始占据概率ψ的影响，以及调查日期对观测概率p的影响
+
+```{r}
+# 提取后验均值
+params_mean <- summary(samples_cov)$statistics[,"Mean"]
+psi0_hat <- params_mean["psiBeta0"]
+psi1_hat <- params_mean["psiBeta1"]
+psi2_hat <- params_mean["psiBeta2"]
+delta0_hat <- params_mean["delta0"]
+delta1_hat <- params_mean["delta1"]
+
+# 森林覆盖率从0%到100%，标准化
+forest_seq <- seq(0, 100, length=100)
+forest_seq_z <- (forest_seq - forest_mean) / forest_sd
+# 海拔取均值0，计算初始占据概率ψ预测值
+psi_pred <- plogis(psi0_hat + psi1_hat * 0 + psi2_hat * forest_seq_z)
+
+# 调查日期范围，标准化
+date_seq <- seq(min(all_dates), max(all_dates), length=100)
+date_seq_z <- (date_seq - date_mean) / date_sd
+# 计算观测概率p预测值
+p_pred <- plogis(delta0_hat + delta1_hat * date_seq_z)
+
+# 绘图：森林覆盖率 vs ψ
+plot(forest_seq, psi_pred, type="l", lwd=2, col="blue",
+     xlab="森林覆盖率(%)", ylab="初始占据概率 ψ",
+     main="森林覆盖率对初始占据概率的影响")
+
+# 绘图：日期 vs p
+plot(date_seq, p_pred, type="l", lwd=2, col="darkgreen",
+     xlab="季节内日期 (儒略日)", ylab="观测概率 p",
+     main="调查日期对观测概率的影响")
+
+
+```
+
+
+```
